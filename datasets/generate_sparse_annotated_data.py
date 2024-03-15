@@ -50,8 +50,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=str, required=True, help="Output file path")
     parser.add_argument("--input", type=str, default="./ytvis_2019/train.json", help="Input file path")
-    parser.add_argument("--unanno", type=int, default=40, help="Percentage of frames to keep for each video segment")
-    parser.add_argument('--anno', type=int, default=10, help="Percentage of videos with annotation information")
+    parser.add_argument("--unanno", type=int, default=40, help="Percentage of frames without annotations")
+    parser.add_argument('--anno', type=int, default=10, help="Percentage of frames with annotations")
     parser.add_argument('-v', '--verbose', action='store_true', help='Increase output verbosity')
     args = parser.parse_args()
     if(args.verbose):
@@ -74,5 +74,6 @@ if __name__ == "__main__":
         ann_frames = sum(video['length']for video in new_data['videos'] if video['id'] <= n_videos)
         unann_frames = sum(video['length']for video in new_data['videos'] if video['id'] > n_videos)
         print("total frames: {}, annotated:{}, unannotated:{}".format(total_frames, ann_frames, unann_frames) )
+        
     with open(args.output, "w") as f_out:
         json.dump(new_data, f_out)
