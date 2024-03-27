@@ -37,8 +37,10 @@ class VisualizationDemo(object):
             self.predictor = AsyncPredictor(cfg, num_gpus=num_gpu)
         else:
             self.predictor = VideoPredictor(cfg)
+        
+        self.threshold = cfg.CONFIDENCE_THRESHOLD
 
-    def run_on_video(self, frames):
+    def run_per_ins(self, frames):
         """
         Args:
             frames (List[np.ndarray]): a list of images of shape (H, W, C) (in BGR order).
@@ -51,9 +53,51 @@ class VisualizationDemo(object):
         predictions = self.predictor(frames)
 
         image_size = predictions["image_size"]
+        th = self.threshold
         pred_scores = predictions["pred_scores"]
-        pred_labels = predictions["pred_labels"]
-        pred_masks = predictions["pred_masks"]
+        indices = [i for i, x in enumerate(pred_scores) if x > th]
+
+        pred_scores = [pred_scores[i] for i in indices]
+        pred_labels = [predictions["pred_labels"][i] for i in indices]
+        pred_masks = [predictions["pred_masks"][i] for i in indices]
+
+        frame_masks = list(zip(*pred_masks))
+        total_vis_output = []
+        for i in range(len(pred_scores)):
+            ins = Instances(image_size)
+            ins_vis_output = []
+            ins.scores = [pred_scores[i]]
+            ins.pred_classes = [pred_labels[i]]
+            for frame_idx in range(len(frames)):
+                frame = frames[frame_idx][:, :, ::-1]
+                ins.pred_masks = [frame_masks[frame_idx][i]]
+                visualizer = TrackVisualizer(frame, self.metadata, instance_mode=self.instance_mode)
+                vis_output = visualizer.draw_instance_predictions(predictions=ins)
+                ins_vis_output.append(vis_output)
+            total_vis_output.append(ins_vis_output)
+        return total_vis_output
+
+    def run_on_video(self, frames):
+        """
+        Args:
+            frames (List[np.ndarray]): a list of images of shape (H, W, C) (in BGR order).
+                This is the format used by OpenCV.
+        Returns:
+            vis_output (VisImage): the visualized image output.
+        """
+        vis_output = None
+        predictions = self.predictor(frames)
+
+        image_size = predictions["image_size"]
+        th = self.threshold
+        pred_scores = predictions["pred_scores"]
+        indices = [i for i, x in enumerate(pred_scores) if x > th]
+
+        pred_scores = [pred_scores[i] for i in indices]
+        pred_labels = [predictions["pred_labels"][i] for i in indices]
+        pred_masks = [predictions["pred_masks"][i] for i in indices]
+
+        # [len, 10, 40]
 
         frame_masks = list(zip(*pred_masks))
         total_vis_output = []
@@ -70,7 +114,6 @@ class VisualizationDemo(object):
             total_vis_output.append(vis_output)
 
         return predictions, total_vis_output
-
 
 class VideoPredictor(DefaultPredictor):
     """

@@ -27,6 +27,10 @@ from mask2former_video.utils.memory import retry_if_cuda_oom
 
 from scipy.optimize import linear_sum_assignment
 
+from demo_video.visualizer import TrackVisualizer
+import os
+from detectron2.data.detection_utils import read_image
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,6 +58,7 @@ class VideoMaskFormer_frame(nn.Module):
         # video
         num_frames,
         window_inference,
+        pseudo_gt_threshold
     ):
         """
         Args:
@@ -97,6 +102,7 @@ class VideoMaskFormer_frame(nn.Module):
 
         self.num_frames = num_frames
         self.window_inference = window_inference
+        self.pseudo_gt_threshold = pseudo_gt_threshold
 
     @classmethod
     def from_config(cls, cfg):
@@ -156,7 +162,9 @@ class VideoMaskFormer_frame(nn.Module):
             "pixel_std": cfg.MODEL.PIXEL_STD,
             # video
             "num_frames": cfg.INPUT.SAMPLING_FRAME_NUM,
-            "window_inference": cfg.MODEL.MASK_FORMER.TEST.WINDOW_INFERENCE
+            "window_inference": cfg.MODEL.MASK_FORMER.TEST.WINDOW_INFERENCE, 
+            #unsupervised
+            "pseudo_gt_threshold": cfg.SOLVER.PSEUDO_GT_THRESHOLD
         }
 
     @property
@@ -189,10 +197,20 @@ class VideoMaskFormer_frame(nn.Module):
                     segments_info (list[dict]): Describe each segment in `panoptic_seg`.
                         Each dict contains keys "id", "category_id", "isthing".
         """
+        ann_images = []
+        unann_images = []
         images = []
+
+        # self.test_pseudo_gt(batched_inputs)
+
         for video in batched_inputs:
             for frame in video["image"]:
-                images.append(frame.to(self.device))
+                if self.training and len(video["instances"][0]) > 0: # annotated
+                    ann_images.append(frame.to(self.device))
+                else:
+                    unann_images.append(frame.to(self.device))
+        images = ann_images + unann_images
+        
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
 
@@ -204,16 +222,27 @@ class VideoMaskFormer_frame(nn.Module):
 
         if self.training:
             # mask classification target
-            targets = self.prepare_targets(batched_inputs, images)
+            targets = self.prepare_targets(batched_inputs, images, outputs)
+            pseudo_gt, refined_pseudo_gt, refined_outputs = self.generate_pseudo_gt(batched_inputs, images, outputs, len(ann_images), len(unann_images), self.pseudo_gt_threshold) # 后段是没标注的
+            targets.extend(refined_pseudo_gt)
+            valid_frames = len(targets)
+            if valid_frames == 0: # No available targets
+                targets = pseudo_gt
+            else:
+                outputs = refined_outputs
 
             outputs, targets = self.frame_decoder_loss_reshape(outputs, targets)
 
             # bipartite matching-based loss
             losses = self.criterion(outputs, targets)
-
+            
             for k in list(losses.keys()):
                 if k in self.criterion.weight_dict:
-                    losses[k] *= self.criterion.weight_dict[k]
+                    if valid_frames:
+                        losses[k] *= self.criterion.weight_dict[k]*len(images)/valid_frames
+                    else:
+                        # 跳过loss计算会卡死，暂且算完后乘以0，略蠢
+                        losses[k] *= 0
                 else:
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
@@ -224,9 +253,9 @@ class VideoMaskFormer_frame(nn.Module):
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
 
-            mask_cls_result = mask_cls_results[0]
-            mask_pred_result = mask_pred_results[0]
-            first_resize_size = (images.tensor.shape[-2], images.tensor.shape[-1])
+            mask_cls_result = mask_cls_results[0] # q c
+            mask_pred_result = mask_pred_results[0] # q t h w
+            first_resize_size = (images.tensor.shape[-2], images.tensor.shape[-1]) # size after padding [384,640]
 
             input_per_image = batched_inputs[0]
             image_size = images.image_sizes[0]  # image size without padding after data augmentation
@@ -283,7 +312,7 @@ class VideoMaskFormer_frame(nn.Module):
 
         # pred_logits: 1 t q c
         # pred_masks: 1 q t h w
-        pred_logits = pred_logits[0]
+        pred_logits = pred_logits[0] # t q c
         pred_masks = einops.rearrange(pred_masks[0], 'q t h w -> t q h w')
         pred_embds = einops.rearrange(pred_embds[0], 'c t q -> t q c')
 
@@ -301,15 +330,15 @@ class VideoMaskFormer_frame(nn.Module):
         for i in range(1, len(pred_logits)):
             indices = self.match_from_embds(out_embds[-1], pred_embds[i])
 
-            out_logits.append(pred_logits[i][indices, :])
+            out_logits.append(pred_logits[i][indices, :]) # q c
             out_masks.append(pred_masks[i][indices, :, :])
             out_embds.append(pred_embds[i][indices, :])
 
-        out_logits = sum(out_logits)/len(out_logits)
+        out_logits = sum(out_logits)/len(out_logits) # 按帧平均
         out_masks = torch.stack(out_masks, dim=1)  # q h w -> q t h w
 
-        out_logits = out_logits.unsqueeze(0)
-        out_masks = out_masks.unsqueeze(0)
+        out_logits = out_logits.unsqueeze(0) # 1 q c
+        out_masks = out_masks.unsqueeze(0) # 1 q t h w
 
         outputs['pred_logits'] = out_logits
         outputs['pred_masks'] = out_masks
@@ -340,11 +369,88 @@ class VideoMaskFormer_frame(nn.Module):
 
         return outputs
 
-    def prepare_targets(self, targets, images):
+    def generate_pseudo_gt(self, batched_inputs, images, outputs, num_ann, num_unann, threshold):
+        '''
+        Args:
+            images: list of images, first num_ann are annotated, last num_unann are unannotated
+            threshold: pseudo_gt_threshold
+        Returns:
+            pseudo_gt: pseudo gt with exactly the format as gt
+            refined_pseudo_gt: pseudo gt, dropped those who have scores < threshold
+            refined_outputs: outputs, dropped those who don't have valid instances
+        Note:
+            之前的实现会有batch内数据均无效的情况，此时需要没有refine的（即返回的pseudo_gt）来假装算一个loss避免卡死
+        '''
+        pred_logits, pred_masks, pred_embds = outputs['pred_logits'], outputs['pred_masks'], outputs['pred_embds']
+        pseudo_gt = []
+        refined_pseudo_gt = []
+        refined_outputs = {}
+        keep_output_idx = [i for i in range(num_ann)]
+        # pred_logits: [n, t=1, q, c]
+        # pred_masks: [n, q, t=1, h, w]
+        pred_logits_list = torch.split(pred_logits, split_size_or_sections=1, dim=0)
+        pred_masks_list = torch.split(pred_masks, split_size_or_sections=1, dim=0)
+        for i in range(num_ann, num_ann+num_unann):# 后num_unann段视频为无标注
+            pred_logits_i = pred_logits_list[i].squeeze()
+            pred_masks_i = pred_masks_list[i].squeeze(0)
+            image_size = images.image_sizes[i] # image size without padding
+            input_per_image = batched_inputs[i]
+            height = images.tensor.shape[-2] # image size after padding
+            width = images.tensor.shape[-1]
+            first_resize_size = (images.tensor.shape[-2], images.tensor.shape[-1])
+            # input logits: [q, c]
+            # input masks: [q, t, h, w]
+            video_output = self.inference_video(pred_logits_i, pred_masks_i, first_resize_size, height, width, first_resize_size)
+            # self.gen_visualization_demo(batched_inputs[i], video_output, height, width)
+
+            gt_i = {
+                "labels": torch.tensor(video_output["pred_labels"], dtype=torch.long, device=self.device),
+                "ids": torch.zeros((10, 1), dtype=torch.long, device=self.device),
+                "masks": torch.stack(video_output["pred_masks"], dim=0).to(self.device)
+            }
+            pseudo_gt.append(gt_i)
+            # generate refined pseudo gt
+            keep_idxs = [i for (i, score) in enumerate(video_output["pred_scores"]) if score > threshold]
+            num_ids = len(keep_idxs)
+            if num_ids > 0:
+                video_output["pred_scores"] = [video_output["pred_scores"][i] for i in keep_idxs]
+                video_output["pred_labels"] = [video_output["pred_labels"][i] for i in keep_idxs]
+                video_output["pred_masks"] = [video_output["pred_masks"][i] for i in keep_idxs]
+                refined_gt_i = {
+                    "labels": torch.tensor(video_output["pred_labels"], dtype=torch.long, device=self.device),
+                    "ids": torch.zeros((num_ids, 1), dtype=torch.long, device=self.device),
+                    "masks": torch.stack(video_output["pred_masks"], dim=0).to(self.device)
+                }
+                refined_pseudo_gt.append(refined_gt_i)
+                keep_output_idx.append(i)
+
+        keep_output_idx = torch.tensor(keep_output_idx).to(self.device)
+
+        filtered_logits = pred_logits.index_select(0, keep_output_idx)
+        filtered_masks = pred_masks.index_select(0, keep_output_idx)
+        filtered_embds = pred_embds.index_select(0, keep_output_idx)
+
+        refined_outputs["pred_logits"] = filtered_logits
+        refined_outputs["pred_masks"] = filtered_masks
+        refined_outputs["pred_embds"] = filtered_embds
+        if 'aux_outputs' in outputs:
+            refined_outputs['aux_outputs'] = []
+            for i in range(len(outputs['aux_outputs'])):
+                aux_i = {}
+                aux_i['pred_masks'] = outputs['aux_outputs'][i]['pred_masks'].index_select(0, keep_output_idx)
+                aux_i['pred_logits'] = outputs['aux_outputs'][i]['pred_logits'].index_select(0, keep_output_idx)
+                refined_outputs['aux_outputs'].append(aux_i)
+
+        return pseudo_gt, refined_pseudo_gt, refined_outputs
+
+    def prepare_targets(self, targets, images, outputs):
         h_pad, w_pad = images.tensor.shape[-2:]
         gt_instances = []
-        for targets_per_video in targets:
+
+        for targets_per_video in targets: #batched_inputs[i], instances in a whole video
             _num_instance = len(targets_per_video["instances"][0])
+            if(_num_instance == 0):
+                continue
             mask_shape = [_num_instance, self.num_frames, h_pad, w_pad]
             gt_masks_per_video = torch.zeros(mask_shape, dtype=torch.bool, device=self.device)
 
@@ -370,22 +476,22 @@ class VideoMaskFormer_frame(nn.Module):
 
     def inference_video(self, pred_cls, pred_masks, img_size, output_height, output_width, first_resize_size):
         if len(pred_cls) > 0:
-            scores = F.softmax(pred_cls, dim=-1)[:, :-1]
+            scores = F.softmax(pred_cls, dim=-1)[:, :-1] # tensor.shape(100, 40)
             labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
             # keep top-10 predictions
             scores_per_image, topk_indices = scores.flatten(0, 1).topk(10, sorted=False)
-            labels_per_image = labels[topk_indices]
-            topk_indices = topk_indices // self.sem_seg_head.num_classes
-            pred_masks = pred_masks[topk_indices]
+            labels_per_image = labels[topk_indices] # 预测值最高的10个instances
+            topk_indices = topk_indices // self.sem_seg_head.num_classes # 0-100
+            pred_masks = pred_masks[topk_indices] # [instance_id, t, h, w]
 
             pred_masks = F.interpolate(
                 pred_masks, size=first_resize_size, mode="bilinear", align_corners=False
-            )
+            ) # [10, video_length, 96, 160] -> [10, video_length, 384, 640]
 
-            pred_masks = pred_masks[:, :, : img_size[0], : img_size[1]]
+            pred_masks = pred_masks[:, :, : img_size[0], : img_size[1]] # remove paddings
             pred_masks = F.interpolate(
                 pred_masks, size=(output_height, output_width), mode="bilinear", align_corners=False
-            )
+            ) # [, , 360, 640] -> [, , 720, 1280]
 
             masks = pred_masks > 0.
 
@@ -405,3 +511,48 @@ class VideoMaskFormer_frame(nn.Module):
         }
 
         return video_output
+
+    def test_pseudo_gt(self, batched_inputs):
+        # test generate_pseudo_gt logic while debugging
+        images = []
+        for video in batched_inputs:
+            for frame in video["image"]:
+                images.append(frame.to(self.device))
+        
+        images = [(x - self.pixel_mean) / self.pixel_std for x in images]
+        images = ImageList.from_tensors(images, self.size_divisibility)
+
+        features = self.backbone(images.tensor)
+        outputs = self.sem_seg_head(features)
+
+        gt = self.prepare_targets(batched_inputs, images, outputs)
+        pseudo_gt = self.generate_pseudo_gt(batched_inputs, images, outputs, 0, len(batched_inputs))
+        return [gt, pseudo_gt]
+
+    def gen_visualization_demo(self, input, prediction, h, w):
+        # generate small demo while debugging, not finished yet
+        path = input["file_names"][0]
+        path = os.path.join("/workspace/vis/MinVIS", path)
+        output_root = "/workspace/vis/MinVIS/demo_video/test_visualization"
+        os.makedirs(output_root, exist_ok=True)
+        
+        image_size = prediction["image_size"]
+        img = torch.zeros(image_size)
+        img = list(img)
+        pred_scores = prediction["pred_scores"]
+        pred_labels = prediction["pred_labels"]
+        pred_masks = prediction["pred_masks"]
+        pred_masks = torch.stack(pred_masks, dim=0)
+        pred_masks = torch.squeeze(pred_masks)
+
+        visualizer = TrackVisualizer(img, metadata=self.metadata)
+        ins = Instances(image_size)
+        if(len(pred_scores) > 0):
+            ins.scores = pred_scores
+            ins.pred_classes = pred_labels
+            ins.pred_masks = pred_masks
+        
+        vis_output = visualizer.draw_instance_predictions(predictions=ins)
+
+        out_filename = os.path.join(output_root, os.path.basename(path))
+        vis_output.save(out_filename)
