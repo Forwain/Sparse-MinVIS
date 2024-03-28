@@ -202,14 +202,19 @@ class VideoMaskFormer_frame(nn.Module):
         images = []
 
         # self.test_pseudo_gt(batched_inputs)
-
-        for video in batched_inputs:
-            for frame in video["image"]:
-                if self.training and len(video["instances"][0]) > 0: # annotated
-                    ann_images.append(frame.to(self.device))
-                else:
-                    unann_images.append(frame.to(self.device))
-        images = ann_images + unann_images
+        if self.training:
+            batched_inputs = self.transform_inputs(batched_inputs)
+            for video in batched_inputs:
+                for (frame, anno) in zip(video["image"], video["instances"]):
+                    if self.training and torch.all(anno.gt_ids > 0) and len(anno.gt_ids) > 0: # annotated
+                        ann_images.append(frame.to(self.device))
+                    else:
+                        unann_images.append(frame.to(self.device))
+            images = ann_images + unann_images
+        else:
+            for video in batched_inputs:
+                for frame in video["image"]:
+                    images.append(frame.to(self.device))
         
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
@@ -222,7 +227,7 @@ class VideoMaskFormer_frame(nn.Module):
 
         if self.training:
             # mask classification target
-            targets = self.prepare_targets(batched_inputs, images, outputs)
+            targets = self.prepare_targets(batched_inputs, images)
             pseudo_gt, refined_pseudo_gt, refined_outputs = self.generate_pseudo_gt(batched_inputs, images, outputs, len(ann_images), len(unann_images), self.pseudo_gt_threshold) # 后段是没标注的
             targets.extend(refined_pseudo_gt)
             valid_frames = len(targets)
@@ -234,6 +239,8 @@ class VideoMaskFormer_frame(nn.Module):
             outputs, targets = self.frame_decoder_loss_reshape(outputs, targets)
 
             # bipartite matching-based loss
+            if len(ann_images) != 1:
+                print("here")
             losses = self.criterion(outputs, targets)
             
             for k in list(losses.keys()):
@@ -241,7 +248,7 @@ class VideoMaskFormer_frame(nn.Module):
                     if valid_frames:
                         losses[k] *= self.criterion.weight_dict[k]*len(images)/valid_frames
                     else:
-                        # 跳过loss计算会卡死，暂且算完后乘以0，略蠢
+                        raise RuntimeError("should not reach here!")
                         losses[k] *= 0
                 else:
                     # remove this loss if not specified in `weight_dict`
@@ -443,13 +450,13 @@ class VideoMaskFormer_frame(nn.Module):
 
         return pseudo_gt, refined_pseudo_gt, refined_outputs
 
-    def prepare_targets(self, targets, images, outputs):
+    def prepare_targets(self, targets, images):
         h_pad, w_pad = images.tensor.shape[-2:]
         gt_instances = []
 
         for targets_per_video in targets: #batched_inputs[i], instances in a whole video
             _num_instance = len(targets_per_video["instances"][0])
-            if(_num_instance == 0):
+            if torch.all(targets_per_video["instances"][0].gt_ids < 0):
                 continue
             mask_shape = [_num_instance, self.num_frames, h_pad, w_pad]
             gt_masks_per_video = torch.zeros(mask_shape, dtype=torch.bool, device=self.device)
@@ -556,3 +563,14 @@ class VideoMaskFormer_frame(nn.Module):
 
         out_filename = os.path.join(output_root, os.path.basename(path))
         vis_output.save(out_filename)
+
+    def transform_inputs(self, batched_inputs):
+        inputs = []
+        for video in batched_inputs:
+            for i in range(len(video["image"])):
+                data = {}
+                data["image"] = [video["image"][i]]
+                data["instances"] = [video["instances"][i]]
+                data["file_names"] = [video["file_names"][i]]
+                inputs.append(data)
+        return inputs

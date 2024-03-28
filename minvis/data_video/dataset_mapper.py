@@ -183,14 +183,14 @@ class YTVISDatasetMapper:
 
         return ret
 
-    def select_frames(self, video_length):
+    def select_frames(self, dataset_dict):
         """
         Args:
-            video_length (int): length of the video
-
+            dataset_dict: 
         Returns:
             selected_idx (list[int]): a list of selected frame indices
         """
+        video_length = dataset_dict['length']
         if self.sampling_frame_ratio < 1.0:
             assert self.sampling_frame_num == 1, "only support subsampling for a single frame"
             subsampled_frames = max(int(np.round(video_length * self.sampling_frame_ratio)), 1)
@@ -204,16 +204,20 @@ class YTVISDatasetMapper:
 
             selected_idx = [ref_frame]
         else:
-            ref_frame = random.randrange(video_length)
-
-            start_idx = max(0, ref_frame-self.sampling_frame_range)
-            end_idx = min(video_length, ref_frame+self.sampling_frame_range + 1)
-
-            selected_idx = np.random.choice(
-                np.array(list(range(start_idx, ref_frame)) + list(range(ref_frame+1, end_idx))),
-                self.sampling_frame_num - 1,
+            annotated_frames = [i for (i, anno) in enumerate(dataset_dict['annotations']) if anno != []]
+            unannotated_frames = [i for (i, anno) in enumerate(dataset_dict['annotations']) if anno == []]
+            assert(len(annotated_frames) > 0), dataset_dict['file_names']
+            num_anno = 1
+            num_unanno = 2
+            selected_anno_idx = np.random.choice(
+                np.array(annotated_frames),
+                num_anno,
             )
-            selected_idx = selected_idx.tolist() + [ref_frame]
+            selected_unanno_idx = np.random.choice(
+                np.array(unannotated_frames),
+                num_unanno,
+            )
+            selected_idx = selected_anno_idx.tolist() + selected_unanno_idx.tolist()
             selected_idx = sorted(selected_idx)
 
         return selected_idx
@@ -231,7 +235,7 @@ class YTVISDatasetMapper:
 
         video_length = dataset_dict["length"]
         if self.is_train:
-            selected_idx = self.select_frames(video_length)
+            selected_idx = self.select_frames(dataset_dict)
             if self.sampling_frame_shuffle:
                 random.shuffle(selected_idx)
         else:
