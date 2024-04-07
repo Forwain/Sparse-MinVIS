@@ -218,7 +218,7 @@ class YTVISDatasetMapper:
                 num_unanno,
             )
             selected_idx = selected_anno_idx.tolist() + selected_unanno_idx.tolist()
-            selected_idx = sorted(selected_idx)
+            # selected_idx = sorted(selected_idx)
 
         return selected_idx
 

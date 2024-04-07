@@ -201,15 +201,10 @@ class VideoMaskFormer_frame(nn.Module):
         unann_images = []
         images = []
 
-        # self.test_pseudo_gt(batched_inputs)
         if self.training:
-            batched_inputs = self.transform_inputs(batched_inputs)
-            for video in batched_inputs:
-                for (frame, anno) in zip(video["image"], video["instances"]):
-                    if self.training and torch.all(anno.gt_ids > 0) and len(anno.gt_ids) > 0: # annotated
-                        ann_images.append(frame.to(self.device))
-                    else:
-                        unann_images.append(frame.to(self.device))
+            ann_inputs, unann_inputs = self.transform_inputs(batched_inputs)
+            ann_images = [video["image"] for video in ann_inputs]
+            unann_images = [video["image"] for video in unann_inputs]
             images = ann_images + unann_images
         else:
             for video in batched_inputs:
@@ -227,29 +222,17 @@ class VideoMaskFormer_frame(nn.Module):
 
         if self.training:
             # mask classification target
-            targets = self.prepare_targets(batched_inputs, images)
-            pseudo_gt, refined_pseudo_gt, refined_outputs = self.generate_pseudo_gt(batched_inputs, images, outputs, len(ann_images), len(unann_images), self.pseudo_gt_threshold) # 后段是没标注的
-            targets.extend(refined_pseudo_gt)
-            valid_frames = len(targets)
-            if valid_frames == 0: # No available targets
-                targets = pseudo_gt
-            else:
-                outputs = refined_outputs
-
+            targets = self.prepare_targets(ann_inputs, images)
+            pseudo_gt = self.generate_pseudo_gt(unann_inputs, images, outputs)
+            targets.extend(pseudo_gt)
             outputs, targets = self.frame_decoder_loss_reshape(outputs, targets)
 
             # bipartite matching-based loss
-            if len(ann_images) != 1:
-                print("here")
             losses = self.criterion(outputs, targets)
             
             for k in list(losses.keys()):
                 if k in self.criterion.weight_dict:
-                    if valid_frames:
-                        losses[k] *= self.criterion.weight_dict[k]*len(images)/valid_frames
-                    else:
-                        raise RuntimeError("should not reach here!")
-                        losses[k] *= 0
+                    losses[k] *= self.criterion.weight_dict[k]
                 else:
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
@@ -376,107 +359,86 @@ class VideoMaskFormer_frame(nn.Module):
 
         return outputs
 
-    def generate_pseudo_gt(self, batched_inputs, images, outputs, num_ann, num_unann, threshold):
+    def generate_pseudo_gt(self, unann_inputs, images, outputs):
         '''
-        Args:
-            images: list of images, first num_ann are annotated, last num_unann are unannotated
-            threshold: pseudo_gt_threshold
         Returns:
             pseudo_gt: pseudo gt with exactly the format as gt
-            refined_pseudo_gt: pseudo gt, dropped those who have scores < threshold
-            refined_outputs: outputs, dropped those who don't have valid instances
-        Note:
-            之前的实现会有batch内数据均无效的情况，此时需要没有refine的（即返回的pseudo_gt）来假装算一个loss避免卡死
         '''
-        pred_logits, pred_masks, pred_embds = outputs['pred_logits'], outputs['pred_masks'], outputs['pred_embds']
+        num_unann = len(unann_inputs)
+        pred_logits = outputs['pred_logits'][-num_unann:, :, :, :]
+        pred_masks = outputs['pred_masks'][-num_unann:, :, :, :]
+        pred_embds = outputs['pred_embds'][-num_unann:, :, :, :]
+
         pseudo_gt = []
-        refined_pseudo_gt = []
         refined_outputs = {}
-        keep_output_idx = [i for i in range(num_ann)]
+        threshold = self.pseudo_gt_threshold
         # pred_logits: [n, t=1, q, c]
         # pred_masks: [n, q, t=1, h, w]
         pred_logits_list = torch.split(pred_logits, split_size_or_sections=1, dim=0)
         pred_masks_list = torch.split(pred_masks, split_size_or_sections=1, dim=0)
-        for i in range(num_ann, num_ann+num_unann):# 后num_unann段视频为无标注
+        for i in range(num_unann):
             pred_logits_i = pred_logits_list[i].squeeze()
             pred_masks_i = pred_masks_list[i].squeeze(0)
-            image_size = images.image_sizes[i] # image size without padding
-            input_per_image = batched_inputs[i]
-            height = images.tensor.shape[-2] # image size after padding
-            width = images.tensor.shape[-1]
-            first_resize_size = (images.tensor.shape[-2], images.tensor.shape[-1])
-            # input logits: [q, c]
-            # input masks: [q, t, h, w]
-            video_output = self.inference_video(pred_logits_i, pred_masks_i, first_resize_size, height, width, first_resize_size)
-            # self.gen_visualization_demo(batched_inputs[i], video_output, height, width)
+            img_size = images.tensor.shape[-2:]
+            scores = F.softmax(pred_logits_i, dim=-1)[:, :-1]
+            labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
+            scores_per_image, topk_indices = scores.flatten(0, 1).topk(10, sorted=False)
+            labels_per_image = labels[topk_indices]
+            topk_indices = topk_indices // self.sem_seg_head.num_classes
+            pred_masks_i = pred_masks_i[topk_indices]
 
-            gt_i = {
-                "labels": torch.tensor(video_output["pred_labels"], dtype=torch.long, device=self.device),
-                "ids": torch.zeros((10, 1), dtype=torch.long, device=self.device),
-                "masks": torch.stack(video_output["pred_masks"], dim=0).to(self.device)
-            }
-            pseudo_gt.append(gt_i)
-            # generate refined pseudo gt
-            keep_idxs = [i for (i, score) in enumerate(video_output["pred_scores"]) if score > threshold]
-            num_ids = len(keep_idxs)
-            if num_ids > 0:
-                video_output["pred_scores"] = [video_output["pred_scores"][i] for i in keep_idxs]
-                video_output["pred_labels"] = [video_output["pred_labels"][i] for i in keep_idxs]
-                video_output["pred_masks"] = [video_output["pred_masks"][i] for i in keep_idxs]
-                refined_gt_i = {
-                    "labels": torch.tensor(video_output["pred_labels"], dtype=torch.long, device=self.device),
-                    "ids": torch.zeros((num_ids, 1), dtype=torch.long, device=self.device),
-                    "masks": torch.stack(video_output["pred_masks"], dim=0).to(self.device)
+            pred_masks_i = F.interpolate(
+                pred_masks_i, size=img_size, mode="bilinear", align_corners=False
+            )
+            masks = pred_masks_i > 0.
+
+            out_scores = scores_per_image.tolist()
+            out_labels = labels_per_image.tolist()
+            out_masks = [m for m in masks.cpu()]
+
+            # generate pseudo gt
+            keep_idxs = [i for (i, score) in enumerate(out_scores) if score > threshold]
+            if len(keep_idxs) > 0:
+                out_scores = [out_scores[i] for i in keep_idxs]
+                out_labels = [out_labels[i] for i in keep_idxs]
+                out_masks = [out_masks[i] for i in keep_idxs]
+                gt_i = {
+                    "labels": torch.tensor(out_labels, dtype=torch.long, device=self.device),
+                    "ids": torch.zeros((len(keep_idxs), 1), dtype=torch.long, device=self.device),
+                    "masks": torch.stack(out_masks, dim=0).to(self.device)
                 }
-                refined_pseudo_gt.append(refined_gt_i)
-                keep_output_idx.append(i)
+            else: # add dummy annnotation
+                gt_i = {
+                    "labels": torch.tensor([40], dtype=torch.long, device=self.device),
+                    "ids": torch.tensor([[-1]], dtype=torch.long, device=self.device),
+                }
+                masks = torch.zeros_like(out_masks[0], device=self.device)
+                masks = masks.unsqueeze(0)
+                gt_i["masks"] = masks
 
-        keep_output_idx = torch.tensor(keep_output_idx).to(self.device)
+            pseudo_gt.append(gt_i)
 
-        filtered_logits = pred_logits.index_select(0, keep_output_idx)
-        filtered_masks = pred_masks.index_select(0, keep_output_idx)
-        filtered_embds = pred_embds.index_select(0, keep_output_idx)
-
-        refined_outputs["pred_logits"] = filtered_logits
-        refined_outputs["pred_masks"] = filtered_masks
-        refined_outputs["pred_embds"] = filtered_embds
-        if 'aux_outputs' in outputs:
-            refined_outputs['aux_outputs'] = []
-            for i in range(len(outputs['aux_outputs'])):
-                aux_i = {}
-                aux_i['pred_masks'] = outputs['aux_outputs'][i]['pred_masks'].index_select(0, keep_output_idx)
-                aux_i['pred_logits'] = outputs['aux_outputs'][i]['pred_logits'].index_select(0, keep_output_idx)
-                refined_outputs['aux_outputs'].append(aux_i)
-
-        return pseudo_gt, refined_pseudo_gt, refined_outputs
+        return pseudo_gt
 
     def prepare_targets(self, targets, images):
         h_pad, w_pad = images.tensor.shape[-2:]
         gt_instances = []
 
-        for targets_per_video in targets: #batched_inputs[i], instances in a whole video
-            _num_instance = len(targets_per_video["instances"][0])
-            if torch.all(targets_per_video["instances"][0].gt_ids < 0):
-                continue
+        for targets_per_video in targets:
+            targets_per_frame = targets_per_video["instances"].to(self.device)
+            h, w = targets_per_frame.image_size
+            _num_instance = len(targets_per_frame)
+
+            assert(self.num_frames == 1), "only support image-level training"
             mask_shape = [_num_instance, self.num_frames, h_pad, w_pad]
             gt_masks_per_video = torch.zeros(mask_shape, dtype=torch.bool, device=self.device)
-
-            gt_ids_per_video = []
-            for f_i, targets_per_frame in enumerate(targets_per_video["instances"]):
-                targets_per_frame = targets_per_frame.to(self.device)
-                h, w = targets_per_frame.image_size
-
-                gt_ids_per_video.append(targets_per_frame.gt_ids[:, None])
-                gt_masks_per_video[:, f_i, :h, :w] = targets_per_frame.gt_masks.tensor
-
-            gt_ids_per_video = torch.cat(gt_ids_per_video, dim=1)
-            valid_idx = (gt_ids_per_video != -1).any(dim=-1)
-
-            gt_classes_per_video = targets_per_frame.gt_classes[valid_idx]          # N,
-            gt_ids_per_video = gt_ids_per_video[valid_idx]                          # N, num_frames
+            # gt_ids_per_video = []
+            gt_ids_per_video = targets_per_frame.gt_ids[:, None]
+            gt_masks_per_video[:, 0, :h, :w] = targets_per_frame.gt_masks.tensor
+            gt_classes_per_video = targets_per_frame.gt_classes          # N,
 
             gt_instances.append({"labels": gt_classes_per_video, "ids": gt_ids_per_video})
-            gt_masks_per_video = gt_masks_per_video[valid_idx].float()          # N, num_frames, H, W
+            gt_masks_per_video = gt_masks_per_video.float()          # N, num_frames, H, W
             gt_instances[-1].update({"masks": gt_masks_per_video})
 
         return gt_instances
@@ -519,58 +481,18 @@ class VideoMaskFormer_frame(nn.Module):
 
         return video_output
 
-    def test_pseudo_gt(self, batched_inputs):
-        # test generate_pseudo_gt logic while debugging
-        images = []
-        for video in batched_inputs:
-            for frame in video["image"]:
-                images.append(frame.to(self.device))
-        
-        images = [(x - self.pixel_mean) / self.pixel_std for x in images]
-        images = ImageList.from_tensors(images, self.size_divisibility)
-
-        features = self.backbone(images.tensor)
-        outputs = self.sem_seg_head(features)
-
-        gt = self.prepare_targets(batched_inputs, images, outputs)
-        pseudo_gt = self.generate_pseudo_gt(batched_inputs, images, outputs, 0, len(batched_inputs))
-        return [gt, pseudo_gt]
-
-    def gen_visualization_demo(self, input, prediction, h, w):
-        # generate small demo while debugging, not finished yet
-        path = input["file_names"][0]
-        path = os.path.join("/workspace/vis/MinVIS", path)
-        output_root = "/workspace/vis/MinVIS/demo_video/test_visualization"
-        os.makedirs(output_root, exist_ok=True)
-        
-        image_size = prediction["image_size"]
-        img = torch.zeros(image_size)
-        img = list(img)
-        pred_scores = prediction["pred_scores"]
-        pred_labels = prediction["pred_labels"]
-        pred_masks = prediction["pred_masks"]
-        pred_masks = torch.stack(pred_masks, dim=0)
-        pred_masks = torch.squeeze(pred_masks)
-
-        visualizer = TrackVisualizer(img, metadata=self.metadata)
-        ins = Instances(image_size)
-        if(len(pred_scores) > 0):
-            ins.scores = pred_scores
-            ins.pred_classes = pred_labels
-            ins.pred_masks = pred_masks
-        
-        vis_output = visualizer.draw_instance_predictions(predictions=ins)
-
-        out_filename = os.path.join(output_root, os.path.basename(path))
-        vis_output.save(out_filename)
-
     def transform_inputs(self, batched_inputs):
-        inputs = []
+        ann_inputs = []
+        unann_inputs = []
+
         for video in batched_inputs:
             for i in range(len(video["image"])):
                 data = {}
-                data["image"] = [video["image"][i]]
-                data["instances"] = [video["instances"][i]]
-                data["file_names"] = [video["file_names"][i]]
-                inputs.append(data)
-        return inputs
+                data["image"] = video["image"][i]
+                data["instances"] = video["instances"][i]
+                data["file_names"] = video["file_names"][i]
+                if torch.all(data["instances"].gt_ids > 0) and len(data["instances"].gt_ids): # annotated
+                    ann_inputs.append(data)
+                else:
+                    unann_inputs.append(data)
+        return ann_inputs, unann_inputs
